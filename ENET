@@ -1,0 +1,146 @@
+# =========================================
+# Elastic Net Feature Selection (ExWAS)
+# Author:  Emily Laveriano
+# Purpose: Identify key determinants of multiple SH metabolic indicators using bootstrapped Elastic Net
+# Requirements: glmnet, caret, dplyr, ggplot2
+# =========================================
+
+library(glmnet)
+library(caret)
+library(dplyr)
+library(ggplot2)
+
+set.seed(1234)
+
+# ----------------------
+# Load your dataset here
+# ----------------------
+# load("data.RData")
+# Expected objects:
+#  - determinants_d : predictors of interest
+#  - covariates_d   : covariates to force in the model
+#  - pp_bisc_f      : outcome measurements
+
+# ----------------------
+# Define outcome groups
+# ----------------------
+outcome_groups <- list(
+  "hormones" = grep("_i_SG_GA_adj$", colnames(pp_bisc_f), value = TRUE),
+  "sum_hormones" = grep("^sum_.*SG_GA_adj$", colnames(pp_bisc_f), value = TRUE),
+  "ratios_SG" = grep("ratio_SG_.*GA_adj$", colnames(pp_bisc_f), value = TRUE),
+  "ratios_phaseI" = {
+    all_ratios <- grep("^ratio.*GA_adj$", colnames(pp_bisc_f), value = TRUE)
+    setdiff(all_ratios, grep("ratio_SG_.*_adj$", colnames(pp_bisc_f), value = TRUE))
+  }
+)
+
+all_outcomes <- unlist(outcome_groups, use.names = FALSE)
+
+# ----------------------
+# Prepare data
+# ----------------------
+log_outcomes <- log2(pp_bisc_f[, all_outcomes, drop=FALSE])
+db <- cbind(determinants_d, covariates_d, log_outcomes) %>% na.omit()
+
+# IQR scaling for numeric determinants
+for(i in seq_along(determinants_d)) {
+  if(is.numeric(db[, i]) && length(unique(db[, i])) > 2) {
+    iqr_val <- quantile(db[, i], 0.75) - quantile(db[, i], 0.25)
+    if(iqr_val > 0) db[, i] <- (db[, i] - quantile(db[, i], 0.25)) / iqr_val
+  }
+}
+
+# Convert categorical variables to dummy variables
+categorical_vars <- db[, sapply(db, is.factor)]
+dummy_vars <- model.matrix(~ . -1, data = categorical_vars)
+numeric_vars <- db[, sapply(db, is.numeric)]
+final_data <- cbind(dummy_vars, numeric_vars)
+
+# ----------------------
+# Elastic Net setup
+# ----------------------
+n_boot <- 100
+alpha_val <- 0.5
+
+# Covariates to force into model
+forced_variables <- c("covariate1", "covariate2")  # replace with your covariates
+
+predictor_vars <- setdiff(colnames(final_data), colnames(log_outcomes))
+
+# Containers
+tuning_results <- data.frame()
+coef_list <- list()
+stable_features <- data.frame()
+
+# ----------------------
+# Run Elastic Net for each outcome
+# ----------------------
+for(outcome_name in colnames(log_outcomes)) {
+  cat("Processing outcome:", outcome_name, "\n")
+  
+  # Train/test split 80/20
+  train_index <- createDataPartition(final_data[[outcome_name]], p = 0.8, list = FALSE)
+  train_set <- final_data[train_index, ]
+  test_set  <- final_data[-train_index, ]
+  
+  x_test <- as.matrix(test_set[, predictor_vars])
+  y_test <- test_set[[outcome_name]]
+  
+  boot_coefs <- list()
+  boot_perf <- data.frame(RMSE=numeric(), Rsquare=numeric())
+  
+  # Bootstrapping
+  for(b in 1:n_boot) {
+    boot_index <- sample(1:nrow(train_set), replace = TRUE)
+    train_boot <- train_set[boot_index, ]
+    
+    x_train <- as.matrix(train_boot[, predictor_vars])
+    y_train <- train_boot[[outcome_name]]
+    
+    # Penalty factor: force covariates
+    penalty <- rep(1, length(predictor_vars))
+    penalty[predictor_vars %in% forced_variables] <- 0
+    names(penalty) <- predictor_vars
+    
+    # Cross-validated Elastic Net
+    cv_fit <- cv.glmnet(x_train, y_train, alpha = alpha_val, nfolds = 10,
+                        family = "gaussian", type.measure = "mse",
+                        penalty.factor = penalty)
+    
+    lambda_min <- cv_fit$lambda.min
+    final_model <- glmnet(x_train, y_train, alpha = alpha_val,
+                          family = "gaussian", penalty.factor = penalty)
+    
+    # Store coefficients
+    coefs <- coef(final_model, s=lambda_min) %>% as.matrix() %>% as.data.frame()
+    colnames(coefs) <- "coef"
+    coefs$variable <- rownames(coefs)
+    coefs$outcome <- outcome_name
+    coefs$bootstrap <- b
+    boot_coefs[[b]] <- coefs
+    
+    # Predict on test set
+    pred_test <- as.numeric(predict(final_model, x_test, s=lambda_min))
+    boot_perf <- rbind(boot_perf,
+                       data.frame(RMSE = sqrt(mean((y_test - pred_test)^2)),
+                                  Rsquare = cor(y_test, pred_test)^2))
+  }
+  
+  # Aggregate results
+  coef_list[[outcome_name]] <- do.call(rbind, boot_coefs)
+  tuning_results <- rbind(tuning_results, data.frame(
+    outcome = outcome_name,
+    RMSE_mean = mean(boot_perf$RMSE),
+    RMSE_sd   = sd(boot_perf$RMSE),
+    Rsquare_mean = mean(boot_perf$Rsquare),
+    Rsquare_sd   = sd(boot_perf$Rsquare)
+  ))
+}
+
+# ----------------------
+# Export results
+# ----------------------
+write.csv(tuning_results, "results/enet_bootstrap_tuning_summary_by_outcome.csv", row.names=FALSE)
+
+all_coefs <- do.call(rbind, coef_list)
+write.csv(all_coefs, "results/enet_bootstrap_coefficients_all_outcomes.csv", row.names=FALSE)
