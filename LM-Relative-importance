@@ -1,0 +1,98 @@
+# =====================================================
+# GLM & Relative Importance Analysis
+# Author: Emily Laveriano
+# Purpose: Linear models for each outcome and relative importance
+# =====================================================
+
+library(dplyr)
+library(broom)
+library(relaimpo)
+library(tibble)
+library(purrr)
+
+set.seed(1234)
+
+# ----------------------
+# Load data
+# ----------------------
+load("bisc_datasets.RData")  
+load("data_glm.Rda")         
+
+# ----------------------
+# Define outcome groups
+# ----------------------
+outcome_groups <- list(
+  hormones      = grep("_i_SG_GA_adj$", colnames(pp_bisc_f), value = TRUE),
+  sum_hormones  = grep("^sum_.*SG_GA_adj$", colnames(pp_bisc_f), value = TRUE),
+  ratios_SG     = grep("ratio_SG_.*GA_adj$", colnames(pp_bisc_f), value = TRUE),
+  ratios_phaseI = {
+    all_ratios <- grep("^ratio.*GA_adj$", colnames(pp_bisc_f), value = TRUE)
+    setdiff(all_ratios, grep("ratio_SG_.*_adj$", all_ratios, value = TRUE))
+  }
+)
+
+all_outcomes <- unlist(outcome_groups, use.names = FALSE)
+
+# ----------------------
+# Prepare data for GLM
+# ----------------------
+log2_outcomes <- log2(pp_bisc_f[, all_outcomes, drop = FALSE])
+data_glm <- cbind(iqr_det_transformed, log2_outcomes, covariates_d)
+
+# ----------------------
+# ENET-selected predictors + covariates
+# ----------------------
+adjust_vars <- c("season_birth_c", "hospital_3tr_recode", "covid_confinement_status")
+
+# Combine ENET predictors with covariates
+all_models <- purrr::imap(enet_results, function(preds, outcome) {
+  list(
+    outcome = outcome,
+    predictors = unique(c(preds, adjust_vars))
+  )
+})
+
+# ----------------------
+# Function: run GLM & compute relative importance
+# ----------------------
+run_relimp <- function(outcome, predictors, data) {
+  formula <- as.formula(paste(outcome, "~", paste(predictors, collapse = " + ")))
+  model <- lm(formula, data = data)
+  
+  rel <- calc.relimp(model, type = "lmg", rela = TRUE)
+  rel_df <- as.data.frame(rel$lmg)
+  model_r2 <- summary(model)$r.squared
+  
+  importance_df <- tibble(
+    outcome = outcome,
+    predictor = rownames(rel_df),
+    rel_importance = rel_df[, 1],
+    model_r2 = model_r2
+  )
+  
+  coef_df <- broom::tidy(model) %>% mutate(outcome = outcome)
+  list(importance = importance_df, coefficients = coef_df)
+}
+
+# ----------------------
+# Run GLM for all outcomes
+# ----------------------
+all_results <- purrr::imap(all_models, function(model, outcome_name) {
+  run_relimp(model$outcome, model$predictors, data_glm)
+})
+
+# Combine results
+all_vip <- dplyr::bind_rows(lapply(all_results, `[[`, "importance"))
+all_coefs <- dplyr::bind_rows(lapply(all_results, `[[`, "coefficients"))
+
+# Filter out covariates for reporting
+vip_filtered <- all_vip %>%
+  filter(!predictor %in% adjust_vars) %>%
+  mutate(abs_variance_exp = rel_importance * model_r2)
+
+# ----------------------
+# Save results
+# ----------------------
+dir.create("results", showWarnings = FALSE)
+saveRDS(vip_filtered, file = "results/bisc_vip_filtered.rds")
+saveRDS(all_coefs, file = "results/all_glm_coefficients.rds")
