@@ -1,0 +1,101 @@
+# =========================================
+# ExWAS Analysis example
+# Author: Emily Laveriano
+# Purpose: ExWAS analysis between determinants and 89 SH molecular features
+# Requirements: tidyverse, broom
+# =========================================
+
+library(tidyverse)
+library(broom)
+
+# ----------------------
+# Define models
+# ----------------------
+models <- list(
+  "unadjusted" = NULL,
+  "model_1" = c("covariate1", "covariate2")  # example covariates
+)
+
+# ----------------------
+# Define outcome groups
+# ----------------------
+outcome_groups <- list(
+  "group1" = grep("pattern1", colnames(data), value = TRUE),
+  "group2" = grep("pattern2", colnames(data), value = TRUE),
+  "group3" = grep("pattern3", colnames(data), value = TRUE)
+)
+
+# ----------------------
+# Formula function
+# ----------------------
+define_formula <- function(outcome, determinant, covariates = NULL, log2 = FALSE) {
+  formula_string <- if (log2) paste0("log2(", outcome, ") ~ ", determinant) else paste0(outcome, " ~ ", determinant)
+  if (!is.null(covariates) && length(covariates) > 0) {
+    formula_string <- paste0(formula_string, " + ", paste(covariates, collapse = " + "))
+  }
+  as.formula(formula_string)
+}
+
+# ----------------------
+# Effective number of tests (ENT)
+# ----------------------
+compute_ENT <- function(data_subset) {
+  cor_matrix <- cor(data_subset, use = "pairwise.complete.obs")
+  eigen_values <- eigen(cor_matrix)$values
+  sum(pmin(eigen_values, 1))
+}
+
+# Example: convert dichotomous determinants to numeric
+determinants <- determinants %>% mutate(across(everything(), as.numeric))
+
+# Compute ENT for each group
+ENT_list <- lapply(outcome_groups, function(x) compute_ENT(data[, x]))
+
+# ----------------------
+# Initialize results
+# ----------------------
+results_list <- lapply(outcome_groups, function(x) data.frame())
+
+# ----------------------
+# Run ExWAS analysis
+# ----------------------
+for(model_name in names(models)) {
+  covariates <- models[[model_name]]
+  
+  for(determinant in colnames(determinants)) {
+    
+    for(group_name in names(outcome_groups)) {
+      outcomes <- outcome_groups[[group_name]]
+      
+      for(outcome in outcomes) {
+        cols <- c(outcome, determinant, covariates)
+        df_filtered <- data[complete.cases(data[, cols]), ]
+        n <- nrow(df_filtered)
+        
+        formula <- define_formula(outcome, determinant, covariates, log2 = TRUE)
+        model <- lm(formula, data = df_filtered)
+        
+        res <- tidy(model, conf.int = TRUE) %>%
+          mutate(outcome = outcome,
+                 predictor = determinant,
+                 sample_size = n,
+                 model = model_name,
+                 signif_thresh = 0.05 / (ENT_list[[group_name]] * length(colnames(determinants))))
+        
+        # Keep only rows for determinant
+        determinant_rows <- grep(paste0("^", determinant), res$term)
+        if(length(determinant_rows) > 0) res <- res[determinant_rows, ]
+        
+        results_list[[group_name]] <- rbind(results_list[[group_name]], res)
+      }
+    }
+  }
+}
+
+# ----------------------
+# Combine results into one dataframe
+# ----------------------
+exwas_results <- do.call(rbind, results_list)
+
+# Save results (optional)
+# write.csv(exwas_results, "exwas_results.csv", row.names = FALSE)
